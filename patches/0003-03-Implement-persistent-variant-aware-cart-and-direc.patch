@@ -1,0 +1,196 @@
+From 24291e86ecea46c06d7f5d906c234e11f630f196 Mon Sep 17 00:00:00 2001
+From: Monclo Development <dev@monclo.local>
+Date: Thu, 22 Oct 2026 02:09:31 +0000
+Subject: [PATCH 3/6] 03: Implement persistent variant-aware cart and direct
+ Buy Now flow
+
+---
+ static/py/app.py | 141 ++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 140 insertions(+), 1 deletion(-)
+
+diff --git a/static/py/app.py b/static/py/app.py
+index 1109862..e497c1a 100644
+--- a/static/py/app.py
++++ b/static/py/app.py
+@@ -11,6 +11,8 @@ selected_size = "All Sizes"
+ selected_price = "All Prices"
+ selected_sort = "featured"
+ search_text = ""
++CART_KEY = "monclo_cart_v1"
++BUY_KEY = "monclo_buy_now_v1"
+ 
+ 
+ def esc(value):
+@@ -45,7 +47,8 @@ def product_card(p):
+     available = p["stock"] > 0
+     size_options = "".join(f'<option value="{esc(s)}">{esc(s)}</option>' for s in p["sizes"])
+     color_options = "".join(f'<option value="{esc(c)}">{esc(c)}</option>' for c in p["colors"])
+-    return f'''<article class="product-card"><div class="product-photo">{image(p['image_url'],p['name'])}<span class="badge-stock">{'IN STOCK' if available else 'SOLD OUT'}</span></div><div class="product-info"><div class="product-category">{esc(p['category'])}</div><h3 class="product-name">{esc(p['name'])}</h3><p class="product-description">{esc(p['description'])}</p><div class="product-meta"><span class="product-price">{peso(p['price_cents'])}</span><span class="small muted">{p['stock']} left</span></div><div class="product-selects"><label class="sr-only" for="size-{p['id']}">Size</label><select class="mini-select" id="size-{p['id']}">{size_options}</select><label class="sr-only" for="color-{p['id']}">Color</label><select class="mini-select" id="color-{p['id']}">{color_options}</select></div><div class="product-actions"><a class="btn btn-sm btn-outline" href="#/shop">VIEW OPTIONS</a><button class="btn btn-sm" disabled title="Cart opens with the next commit">COMING SOON</button></div></div></article>'''
++    disabled = "" if available else "disabled"
++    return f'''<article class="product-card"><div class="product-photo">{image(p['image_url'],p['name'])}<span class="badge-stock">{'IN STOCK' if available else 'SOLD OUT'}</span></div><div class="product-info"><div class="product-category">{esc(p['category'])}</div><h3 class="product-name">{esc(p['name'])}</h3><p class="product-description">{esc(p['description'])}</p><div class="product-meta"><span class="product-price">{peso(p['price_cents'])}</span><span class="small muted">{p['stock']} left</span></div><div class="product-selects"><label class="sr-only" for="size-{p['id']}">Size</label><select class="mini-select" id="size-{p['id']}">{size_options}</select><label class="sr-only" for="color-{p['id']}">Color</label><select class="mini-select" id="color-{p['id']}">{color_options}</select></div><div class="product-selects"><label for="qty-{p['id']}" class="small muted">QUANTITY</label><input class="mini-select" type="number" id="qty-{p['id']}" min="1" max="{p['stock']}" value="1" {disabled}></div><div class="product-actions"><button class="btn btn-sm btn-outline" data-action="add" data-id="{p['id']}" {disabled}>ADD TO BAG</button><button class="btn btn-sm" data-action="buy" data-id="{p['id']}" {disabled}>BUY NOW ↗</button></div></div></article>'''
+ 
+ 
+ def render_home():
+@@ -89,9 +92,137 @@ def update_shop_results():
+         document.getElementById("results-count").textContent = f"{len(visible_products())} products"
+ 
+ 
++def lookup(product_id):
++    return next((p for p in products if p["id"] == product_id), None)
++
++
++def read_items(storage, key):
++    try:
++        value = json.loads(str(storage.getItem(key) or "[]"))
++        if not isinstance(value, list): return []
++        valid = []
++        for item in value:
++            if not isinstance(item, dict): continue
++            pid, size, color, qty = item.get("product_id"), item.get("size"), item.get("color"), item.get("quantity")
++            p = lookup(pid)
++            if p and isinstance(qty, int) and 1 <= qty <= p["stock"] and size in p["sizes"] and color in p["colors"]:
++                valid.append({"product_id": pid, "size": size, "color": color, "quantity": qty})
++        return valid
++    except Exception:
++        return []
++
++
++def cart_items():
++    return read_items(window.localStorage, CART_KEY)
++
++
++def checkout_items():
++    chosen = read_items(window.sessionStorage, BUY_KEY)
++    return chosen if chosen else cart_items()
++
++
++def save_cart(items):
++    window.localStorage.setItem(CART_KEY, json.dumps(items))
++    update_badge()
++
++
++def update_badge():
++    document.getElementById("cart-count").textContent = str(sum(item["quantity"] for item in cart_items()))
++
++
++async def hide_toast_later():
++    await asyncio.sleep(3)
++    document.getElementById("toast").classList.remove("show")
++
++
++def toast(text):
++    element = document.getElementById("toast")
++    element.textContent = text
++    element.classList.add("show")
++    document.getElementById("app-status").textContent = text
++    asyncio.create_task(hide_toast_later())
++
++
++def add_product(pid, buy=False):
++    p = lookup(pid)
++    if not p or p["stock"] < 1:
++        toast("Sorry, this item is no longer available."); return
++    try: qty = int(document.getElementById(f"qty-{pid}").value)
++    except Exception: qty = 0
++    if not (1 <= qty <= p["stock"]):
++        toast("Please enter a valid quantity."); return
++    size = str(document.getElementById(f"size-{pid}").value)
++    color = str(document.getElementById(f"color-{pid}").value)
++    if size not in p["sizes"] or color not in p["colors"]:
++        toast("Please choose a valid size and color."); return
++    item = {"product_id":pid,"size":size,"color":color,"quantity":qty}
++    if buy:
++        window.sessionStorage.setItem(BUY_KEY, json.dumps([item]))
++        window.location.hash = "/checkout"
++        return
++    current = cart_items()
++    used = sum(i["quantity"] for i in current if i["product_id"] == pid)
++    if used + qty > p["stock"]:
++        toast("Not enough stock for that quantity."); return
++    match = next((i for i in current if (i["product_id"],i["size"],i["color"]) == (pid,size,color)), None)
++    if match: match["quantity"] += qty
++    else: current.append(item)
++    save_cart(current)
++    toast(f"{p['name']} added to your bag.")
++
++
++def delivery_cents(items):
++    return 12000 if items else 0
++
++
++def totals(items):
++    subtotal = sum(lookup(i["product_id"])["price_cents"]*i["quantity"] for i in items if lookup(i["product_id"]))
++    return subtotal, delivery_cents(items), subtotal+delivery_cents(items)
++
++
++def summary(items, checkout=False):
++    sub, delivery, total = totals(items)
++    detail = "".join(f'<div class="total-row small"><span>{esc(lookup(i["product_id"])["name"])} · {esc(i["size"])} / {esc(i["color"])} ×{i["quantity"]}</span><strong>{peso(lookup(i["product_id"])["price_cents"]*i["quantity"])}</strong></div>' for i in items if lookup(i["product_id"]))
++    action = '<button class="btn btn-block" data-action="checkout">PROCEED TO CHECKOUT ↗</button>' if not checkout else ''
++    return f'<aside class="summary-card"><h3>Order summary</h3>{detail}<div class="total-row"><span>Subtotal</span><strong>{peso(sub)}</strong></div><div class="total-row"><span>Delivery fee</span><strong>{peso(delivery)}</strong></div><div class="total-row major"><span>Total due</span><span>{peso(total)}</span></div>{action}<div class="help-note">Secure checkout · Cash on Delivery only</div></aside>'
++
++
++def render_cart():
++    items = cart_items()
++    if not items:
++        page(hero("Your Shopping Bag", "Your next favorite piece is one click away.")+'''<section class="section"><div class="container"><div class="empty-state"><h3>Your bag is feeling a little light.</h3><p>Explore our collection and add something you love.</p><a href="#/shop" class="btn">CONTINUE SHOPPING ↗</a></div></div></section>''')
++        return
++    cards = ""
++    for index, item in enumerate(items):
++        p = lookup(item["product_id"])
++        if not p: continue
++        cards += f'''<article class="cart-item">{image(p['image_url'],p['name'],'class="cart-thumb"')}<div><h3>{esc(p['name'])}</h3><p>Size: {esc(item['size'])} · Color: {esc(item['color'])}</p><div class="qty-control"><button data-action="cart-minus" data-index="{index}" aria-label="Decrease quantity">−</button><span>{item['quantity']}</span><button data-action="cart-plus" data-index="{index}" aria-label="Increase quantity">+</button></div><p><button class="remove-btn" data-action="cart-remove" data-index="{index}">Remove</button></p></div><strong>{peso(p['price_cents']*item['quantity'])}</strong></article>'''
++    page(hero("Your Shopping Bag", "Review your picks before checkout.")+f'<section class="section"><div class="container cart-layout"><div><span class="eyebrow">YOUR SELECTION · {sum(i["quantity"] for i in items)} ITEMS</span>{cards}<a href="#/shop" class="text-link" style="display:inline-block;margin-top:23px">← CONTINUE SHOPPING</a></div>{summary(items)}</div></section>')
++
++
++def modify_cart(action, index):
++    items = cart_items()
++    if not 0 <= index < len(items): return
++    item = items[index]
++    if action == "cart-remove": items.pop(index)
++    elif action == "cart-minus":
++        item["quantity"] -= 1
++        if item["quantity"] < 1: items.pop(index)
++    elif action == "cart-plus":
++        p = lookup(item["product_id"])
++        all_qty = sum(i["quantity"] for i in items if i["product_id"]==item["product_id"])
++        if p and all_qty >= p["stock"]:
++            toast("You have reached available stock."); return
++        item["quantity"] += 1
++    save_cart(items)
++    render_cart()
++
++
+ def render():
+     route = get_route()
+     if route == "/shop": render_shop()
++    elif route == "/cart": render_cart()
++    elif route == "/checkout": render_cart()
+     else: render_home()
+ 
+ 
+@@ -103,6 +234,13 @@ def on_click(event):
+     if action == "category":
+         selected_category = el.getAttribute("data-category")
+         render_shop()
++    elif action in ("add", "buy"):
++        add_product(int(el.getAttribute("data-id")), action == "buy")
++    elif action in ("cart-plus", "cart-minus", "cart-remove"):
++        modify_cart(action, int(el.getAttribute("data-index")))
++    elif action == "checkout":
++        window.sessionStorage.removeItem(BUY_KEY)
++        window.location.hash = "/checkout"
+     elif action == "clear-filters":
+         selected_category, selected_size, selected_price, search_text = "All Products", "All Sizes", "All Prices", ""
+         render_shop()
+@@ -129,6 +267,7 @@ async def init():
+         resp = await window.fetch("/api/products")
+         if not resp.ok: raise RuntimeError("Product service unavailable")
+         products = (await resp.json()).to_py()["products"]
++        update_badge()
+         render()
+     except Exception:
+         document.getElementById("page-content").innerHTML = '<div class="container empty-state"><h2>Our collection is temporarily unavailable.</h2><p>Please refresh the page or try again shortly.</p></div>'
+-- 
+2.47.3
+

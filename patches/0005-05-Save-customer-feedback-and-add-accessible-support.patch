@@ -1,0 +1,174 @@
+From 15b4ca4e841a43158d19dadabe7b0726c56190f7 Mon Sep 17 00:00:00 2001
+From: Monclo Development <dev@monclo.local>
+Date: Thu, 22 Oct 2026 02:12:08 +0000
+Subject: [PATCH 5/6] 05: Save customer feedback and add accessible support and
+ FAQ page
+
+---
+ server.py            |  7 ++++++
+ static/py/app.py     | 56 +++++++++++++++++++++++++++++++++++++++++++-
+ support.py           | 26 ++++++++++++++++++++
+ templates/index.html |  2 +-
+ 4 files changed, 89 insertions(+), 2 deletions(-)
+ create mode 100644 support.py
+
+diff --git a/server.py b/server.py
+index 04e36e0..7067a02 100644
+--- a/server.py
++++ b/server.py
+@@ -3,6 +3,7 @@ import os
+ from flask import Flask, render_template
+ from store import get_db, close_db, init_db, serialize_product
+ from checkout import register_order_routes
++from support import register_support_routes
+ 
+ 
+ def create_app(test_config=None):
+@@ -30,6 +31,12 @@ def create_app(test_config=None):
+         return {"products": [serialize_product(row) for row in rows]}
+ 
+     register_order_routes(app)
++    register_support_routes(app)
++
++    @app.get("/api/config")
++    def public_config():
++        return {"contact_email": os.environ.get("MONCLO_CONTACT_EMAIL", ""),
++                "instagram_url": os.environ.get("MONCLO_INSTAGRAM_URL", "")}
+ 
+     @app.get("/")
+     def index():
+diff --git a/static/py/app.py b/static/py/app.py
+index 1464b06..02a75df 100644
+--- a/static/py/app.py
++++ b/static/py/app.py
+@@ -306,12 +306,49 @@ def render_confirmation():
+     page(f'''<section class="section"><div class="container"><div class="success-panel"><div class="success-mark">✓</div><span class="eyebrow">ORDER SAVED SUCCESSFULLY</span><h2>Thank you for your order!</h2><p>Your order has been placed with Cash on Delivery.<br>Save your reference number for any order inquiries.</p><h3 style="font-size:25px;margin:22px 0">{esc(order["reference"])}</h3><div class="order-details">{details}<div class="total-row"><span>Subtotal</span><strong>{peso(order["subtotal_cents"])}</strong></div><div class="total-row"><span>Delivery fee</span><strong>{peso(order["delivery_cents"])}</strong></div><div class="total-row major"><span>Total to pay on delivery</span><strong>{peso(order["total_cents"])}</strong></div><p class="small"><strong>Payment:</strong> Cash on Delivery (COD)<br><strong>Recipient:</strong> {esc(order["customer_name"])}<br><strong>Mobile:</strong> {esc(order["phone"])}<br><strong>Delivery address:</strong> {address}</p></div><a class="btn" href="#/shop">BACK TO SHOP ↗</a></div></div></section>''')
+ 
+ 
++def render_support():
++    categories = ["General Inquiry", "Product Question", "Order Concern", "Website Feedback", "Suggestion", "Other"]
++    options = "".join(f'<option value="{esc(c)}">{esc(c)}</option>' for c in categories)
++    form = f'''<div><span class="eyebrow">GET IN TOUCH</span><h2>Send us a message.</h2><p class="muted">Have a question, suggestion, or concern? Contact Monclo Apparel. Your feedback helps us improve your shopping experience.</p><form class="form-section" id="support-form"><div class="form-grid"><label class="form-field">Full name *<input class="field" name="name" required minlength="2" maxlength="90" autocomplete="name"></label><label class="form-field">Email address *<input class="field" type="email" name="email" required autocomplete="email" maxlength="254"></label><label class="form-field wide">How can we help? *<select class="field" name="category" required>{options}</select></label><label class="form-field wide">Your message *<textarea class="field" name="message" minlength="10" maxlength="3000" required placeholder="Tell us how we can help..."></textarea></label></div><p class="form-error" id="feedback-error" role="alert"></p><button id="feedback-submit" type="submit" class="btn" style="margin-top:19px">SUBMIT FEEDBACK ↗</button></form></div>'''
++    faqs = [("How do I place an order?", "Browse the Shop, choose your size, color and quantity, then select Add to Bag or Buy Now. Review your details, select Cash on Delivery and place your order."),
++            ("How does Cash on Delivery work?", "You pay in cash when your order arrives at the address you provided. Monclo does not ask for credit card details."),
++            ("What is the delivery fee?", "The sample store applies a flat ₱120 delivery fee per order. Update the fee in the Python checkout backend and storefront together for your real delivery rates."),
++            ("Can I change my cart before checkout?", "Yes. Open Your Bag to change quantities or remove products. You can also select Buy Now to checkout one product directly."),
++            ("What if my order cannot be submitted?", "Check the required delivery fields and your product quantities. If the store reports an error, no success confirmation is shown unless your order was saved."),
++            ("How can I ask about my order?", "Choose Order Concern in this form, describe your issue, and include your Monclo order reference number in the message.")]
++    accordion = "".join(f'<details><summary>{esc(q)}</summary><p>{esc(a)}</p></details>' for q,a in faqs)
++    side = f'<div><span class="eyebrow">GOOD TO KNOW</span><h2>Frequently asked questions.</h2><div class="faq-list">{accordion}</div><div class="notice" style="margin-top:25px">Need more help? Send us a message through the form and our team can review it in the store admin panel.</div></div>'
++    page(hero("We're Here to Help", "Real questions deserve helpful answers.", "MONCLO CUSTOMER CARE") + f'<section class="section"><div class="container support-grid">{form}{side}</div></section>')
++
++
++async def submit_feedback():
++    form = document.getElementById("support-form")
++    if not form or not form.checkValidity():
++        if form: form.reportValidity()
++        return
++    data = {k: str(form.elements.namedItem(k).value).strip() for k in ("name", "email", "category", "message")}
++    btn = document.getElementById("feedback-submit")
++    btn.disabled = True
++    btn.textContent = "SAVING FEEDBACK..."
++    try:
++        response = await api_request("/api/feedback", data, "POST")
++        form.reset()
++        document.getElementById("feedback-error").textContent = ""
++        toast(response["message"])
++        btn.textContent = "FEEDBACK SAVED ✓"
++    except Exception as exc:
++        document.getElementById("feedback-error").textContent = str(exc)
++        btn.disabled = False
++        btn.textContent = "SUBMIT FEEDBACK ↗"
++
++
+ def render():
+     route = get_route()
+     if route == "/shop": render_shop()
+     elif route == "/cart": render_cart()
+     elif route == "/checkout": render_checkout()
+     elif route == "/confirmation": render_confirmation()
++    elif route == "/support": render_support()
+     else: render_home()
+ 
+ 
+@@ -337,7 +374,10 @@ def on_click(event):
+ 
+ 
+ def on_submit(event):
+-    if event.target.id == "order-form":
++    if event.target.id == "support-form":
++        event.preventDefault()
++        asyncio.create_task(submit_feedback())
++    elif event.target.id == "order-form":
+         event.preventDefault()
+         asyncio.create_task(place_order())
+ 
+@@ -363,6 +403,20 @@ async def init():
+         if not resp.ok: raise RuntimeError("Product service unavailable")
+         products = (await resp.json()).to_py()["products"]
+         update_badge()
++        try:
++            cfg_resp = await window.fetch("/api/config")
++            if cfg_resp.ok:
++                cfg = (await cfg_resp.json()).to_py()
++                if cfg.get("contact_email"):
++                    e = document.getElementById("email-link")
++                    e.href = "mailto:" + cfg["contact_email"]
++                    e.textContent = "Email: " + cfg["contact_email"]
++                if cfg.get("instagram_url", "").startswith("https://"):
++                    s = document.getElementById("social-link")
++                    s.href = cfg["instagram_url"]
++                    s.textContent = "Instagram ↗"
++                    s.target = "_blank"
++        except Exception: pass
+         render()
+     except Exception:
+         document.getElementById("page-content").innerHTML = '<div class="container empty-state"><h2>Our collection is temporarily unavailable.</h2><p>Please refresh the page or try again shortly.</p></div>'
+diff --git a/support.py b/support.py
+new file mode 100644
+index 0000000..b570170
+--- /dev/null
++++ b/support.py
+@@ -0,0 +1,26 @@
++"""Working support / feedback submission API."""
++import re
++from flask import request, jsonify
++from store import get_db
++
++CATEGORIES = ("General Inquiry", "Product Question", "Order Concern", "Website Feedback", "Suggestion", "Other")
++EMAIL = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
++
++
++def register_support_routes(app):
++    @app.post("/api/feedback")
++    def send_feedback():
++        data = request.get_json(silent=True)
++        if not isinstance(data, dict): return jsonify(error="Please submit the support form."), 400
++        name, email, category, message = (data.get(k) for k in ("name", "email", "category", "message"))
++        if not all(isinstance(x, str) for x in (name, email, category, message)):
++            return jsonify(error="All fields are required."), 400
++        name, email, message = name.strip(), email.strip().lower(), message.strip()
++        if not 2 <= len(name) <= 90: return jsonify(error="Name must be 2–90 characters."), 400
++        if len(email) > 254 or not EMAIL.fullmatch(email): return jsonify(error="Enter a valid email address."), 400
++        if category not in CATEGORIES: return jsonify(error="Select a valid feedback category."), 400
++        if not 10 <= len(message) <= 3000: return jsonify(error="Message must be 10–3000 characters."), 400
++        db = get_db()
++        cursor = db.execute("INSERT INTO feedback (name,email,category,message) VALUES (?,?,?,?)", (name,email,category,message))
++        db.commit()
++        return jsonify(saved=True, feedback_id=cursor.lastrowid, message="Your feedback has been saved. Thank you for reaching out!"), 201
+diff --git a/templates/index.html b/templates/index.html
+index 797a85a..517e978 100644
+--- a/templates/index.html
++++ b/templates/index.html
+@@ -24,7 +24,7 @@
+   </header>
+   <div id="app-status" class="sr-only" role="status" aria-live="polite"></div>
+   <main id="page-content"><div class="container loading-screen"><div class="spinner"></div><p>Preparing your collection…</p></div></main>
+-  <footer class="footer"><div class="container footer-grid"><div><a href="#/" class="footer-logo">MONCLO <span>APPAREL.</span></a><p>Modern essentials, made for your every day. Your style. Your story.</p></div><div><strong>Explore</strong><a href="#/">Home</a><a href="#/shop">Shop all</a><a href="#/cart">Your bag</a></div><div><strong>Customer care</strong><a href="#/support">Contact &amp; feedback</a><a href="#/support">FAQ</a><span>Cash on Delivery</span></div><div><strong>Connect</strong><span>Philippines</span><a id="social-link" href="https://www.instagram.com/" target="_blank" rel="noopener noreferrer">Instagram ↗</a><a id="email-link" href="mailto:hello@monclo.example">Email us ↗</a></div></div><div class="container footer-bottom"><span>© 2026 Monclo Apparel. All rights reserved.</span><span>DESIGNED TO BE DIFFERENT ✦</span></div></footer>
++  <footer class="footer"><div class="container footer-grid"><div><a href="#/" class="footer-logo">MONCLO <span>APPAREL.</span></a><p>Modern essentials, made for your every day. Your style. Your story.</p></div><div><strong>Explore</strong><a href="#/">Home</a><a href="#/shop">Shop all</a><a href="#/cart">Your bag</a></div><div><strong>Customer care</strong><a href="#/support">Contact &amp; feedback</a><a href="#/support">FAQ</a><span>Cash on Delivery</span></div><div><strong>Connect</strong><span>Philippines</span><a id="social-link" href="#/support">Instagram (configure link)</a><a id="email-link" href="#/support">Use our support form ↗</a></div></div><div class="container footer-bottom"><span>© 2026 Monclo Apparel. All rights reserved.</span><span>DESIGNED TO BE DIFFERENT ✦</span></div></footer>
+   <div class="toast" id="toast" role="status" aria-live="polite"></div>
+   <script type="py" src="/static/py/app.py"></script>
+ </body>
+-- 
+2.47.3
+

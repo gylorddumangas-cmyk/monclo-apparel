@@ -1,0 +1,288 @@
+From f81037f6d0fc361640ee719a3524a19ad6957827 Mon Sep 17 00:00:00 2001
+From: Monclo Development <dev@monclo.local>
+Date: Thu, 22 Oct 2026 02:07:59 +0000
+Subject: [PATCH 2/6] 02: Add SQLite product catalog API and PyScript-powered
+ shop filters
+
+---
+ server.py        |  11 ++++
+ static/py/app.py | 144 ++++++++++++++++++++++++++++++++++++++++++++---
+ store.py         |  81 ++++++++++++++++++++++++++
+ 3 files changed, 228 insertions(+), 8 deletions(-)
+ create mode 100644 store.py
+
+diff --git a/server.py b/server.py
+index 4a5f845..e0afd99 100644
+--- a/server.py
++++ b/server.py
+@@ -1,6 +1,7 @@
+ """Monclo Apparel's Flask entry point."""
+ import os
+ from flask import Flask, render_template
++from store import get_db, close_db, init_db, serialize_product
+ 
+ 
+ def create_app(test_config=None):
+@@ -17,6 +18,16 @@ def create_app(test_config=None):
+         app.config.update(test_config)
+     os.makedirs(os.path.dirname(app.config["DATABASE"]), exist_ok=True)
+ 
++    app.teardown_appcontext(close_db)
++    with app.app_context():
++        init_db()
++
++    @app.get("/api/products")
++    def products():
++        db = get_db()
++        rows = db.execute("SELECT * FROM products WHERE active=1 ORDER BY featured DESC, id ASC").fetchall()
++        return {"products": [serialize_product(row) for row in rows]}
++
+     @app.get("/")
+     def index():
+         return render_template("index.html")
+diff --git a/static/py/app.py b/static/py/app.py
+index 4a395aa..1109862 100644
+--- a/static/py/app.py
++++ b/static/py/app.py
+@@ -1,15 +1,143 @@
+-"""PyScript client. All dynamic interactions live in Python, not JavaScript."""
+-from pyscript import document
++"""Monclo storefront logic, running entirely in browser-side Python via PyScript."""
++import asyncio
++import html
++import json
++from pyscript import document, window
++from pyodide.ffi import create_proxy
++
++products = []
++selected_category = "All Products"
++selected_size = "All Sizes"
++selected_price = "All Prices"
++selected_sort = "featured"
++search_text = ""
++
++
++def esc(value):
++    return html.escape(str(value), quote=True)
++
++
++def peso(cents):
++    return "₱" + f"{cents/100:,.2f}"
++
++
++def image(url, alt, extra=""):
++    return f'<img src="{esc(url)}" alt="{esc(alt)}" loading="lazy" {extra}>'
++
++
++def get_route():
++    return str(window.location.hash or "#/").split("?")[0][1:] or "/"
++
++
++def page(content):
++    document.getElementById("page-content").innerHTML = content
++    route = get_route().strip("/").split("/")[0] or "home"
++    for link in document.querySelectorAll("[data-nav]"):
++        link.classList.toggle("active", link.getAttribute("data-nav") == route)
++    window.scrollTo(0, 0)
++
++
++def hero(title, subtitle, eyebrow="THE MONCLO COLLECTION"):
++    return f'<div class="page-hero"><div class="container"><span class="eyebrow">{esc(eyebrow)}</span><h1>{esc(title)}</h1><p>{esc(subtitle)}</p></div></div>'
++
++
++def product_card(p):
++    available = p["stock"] > 0
++    size_options = "".join(f'<option value="{esc(s)}">{esc(s)}</option>' for s in p["sizes"])
++    color_options = "".join(f'<option value="{esc(c)}">{esc(c)}</option>' for c in p["colors"])
++    return f'''<article class="product-card"><div class="product-photo">{image(p['image_url'],p['name'])}<span class="badge-stock">{'IN STOCK' if available else 'SOLD OUT'}</span></div><div class="product-info"><div class="product-category">{esc(p['category'])}</div><h3 class="product-name">{esc(p['name'])}</h3><p class="product-description">{esc(p['description'])}</p><div class="product-meta"><span class="product-price">{peso(p['price_cents'])}</span><span class="small muted">{p['stock']} left</span></div><div class="product-selects"><label class="sr-only" for="size-{p['id']}">Size</label><select class="mini-select" id="size-{p['id']}">{size_options}</select><label class="sr-only" for="color-{p['id']}">Color</label><select class="mini-select" id="color-{p['id']}">{color_options}</select></div><div class="product-actions"><a class="btn btn-sm btn-outline" href="#/shop">VIEW OPTIONS</a><button class="btn btn-sm" disabled title="Cart opens with the next commit">COMING SOON</button></div></div></article>'''
+ 
+ 
+ def render_home():
+-    document.getElementById("page-content").innerHTML = """
+-      <section class="hero"><div class="container hero-inner"><div class="hero-copy"><span class="hero-kicker">MONCLO APPAREL · EST. 2026</span><h1>Wear Your Style.<br><em>Define Your Identity.</em></h1><p>Discover modern essentials and everyday streetwear designed to express your individuality.</p><a class="btn" href="#/shop">EXPLORE THE COLLECTION <span>↗</span></a></div><div class="hero-visual"><img src="https://images.unsplash.com/photo-1529139574466-a303027c1d8b?w=1000&q=85&fit=crop" alt="Contemporary streetwear fashion editorial"></div></div></section>
++    page('''<section class="hero"><div class="container hero-inner"><div class="hero-copy"><span class="hero-kicker">MONCLO APPAREL · EST. 2026</span><h1>Wear Your Style.<br><em>Define Your Identity.</em></h1><p>Discover modern essentials and everyday streetwear designed to express your individuality.</p><a class="btn" href="#/shop">EXPLORE THE COLLECTION <span>↗</span></a></div><div class="hero-visual"><img src="https://images.unsplash.com/photo-1529139574466-a303027c1d8b?w=1000&q=85&fit=crop" alt="Contemporary streetwear fashion editorial"></div></div></section>
+       <div class="container benefit-row"><div class="benefit-mini"><span>✦</span> EVERYDAY ESSENTIALS</div><div class="benefit-mini"><span>◇</span> CURATED FOR COMFORT</div><div class="benefit-mini"><span>↗</span> CASH ON DELIVERY</div></div>
+-      <section class="section"><div class="container"><div class="section-head"><div><span class="eyebrow">CURATED FOR YOU</span><h2>The Current Edit.</h2></div><a class="text-link" href="#/shop">VIEW ALL PRODUCTS ↗</a></div><p class="muted">Discover elevated essentials for every day.</p><div id="featured-grid" class="product-grid"></div></div></section>
++      <section class="section"><div class="container"><div class="section-head"><div><span class="eyebrow">CURATED FOR YOU</span><h2>The Current Edit.</h2></div><a class="text-link" href="#/shop">VIEW ALL PRODUCTS ↗</a></div><div class="product-grid">'''+"".join(product_card(p) for p in products if p["featured"])+'''</div></div></section>
+       <section class="section section-alt"><div class="container about-layout"><div class="about-panel"><img src="https://images.unsplash.com/photo-1483985988355-763728e1935b?w=1050&q=85&fit=crop" alt="Minimal streetwear fashion selection" loading="lazy"></div><div class="about-content"><span class="eyebrow">A LITTLE ABOUT US</span><h2>Style that speaks for itself.</h2><p>Monclo Apparel is built for the everyday individual. We believe the best pieces don't shout — they just fit perfectly into your story.</p><p>Versatile, comfortable, intentionally selected. Wear what feels like you.</p><a class="btn btn-outline" href="#/shop">DISCOVER MONCLO ↗</a></div></div></section>
+       <section class="section"><div class="container"><div class="section-head"><div><span class="eyebrow">THE MONCLO DIFFERENCE</span><h2>Why shop with us?</h2></div></div><div class="features-grid"><div class="feature"><div class="feature-icon">✦</div><h3>Made for everyday style</h3><p>Versatile pieces designed to work with your wardrobe, every day.</p></div><div class="feature"><div class="feature-icon">◇</div><h3>Shopping made simple</h3><p>A seamless way to find your fit and discover your next favorite.</p></div><div class="feature"><div class="feature-icon">↗</div><h3>Easy Cash on Delivery</h3><p>Order with confidence and pay when your parcel arrives.</p></div></div></div></section>
+-      <section class="newsletter"><span class="eyebrow">THE MONCLO WAY</span><h2>Your next favorite fit starts here.</h2><p>Find pieces that feel as good as they look.</p><a class="btn btn-light" href="#/shop">SHOP THE COLLECTION ↗</a></section>
+-    """
++      <section class="newsletter"><span class="eyebrow">THE MONCLO WAY</span><h2>Your next favorite fit starts here.</h2><p>Find pieces that feel as good as they look.</p><a class="btn btn-light" href="#/shop">SHOP THE COLLECTION ↗</a></section>''')
++
++
++def visible_products():
++    result = [p for p in products if (selected_category == "All Products" or p["category"] == selected_category) and (selected_size == "All Sizes" or selected_size in p["sizes"]) and search_text.lower() in p["name"].lower()]
++    result = [p for p in result if selected_price == "All Prices" or (selected_price == "Under ₱1,000" and p["price_cents"] < 100000) or (selected_price == "₱1,000 – ₱1,500" and 100000 <= p["price_cents"] <= 150000) or (selected_price == "Over ₱1,500" and p["price_cents"] > 150000)]
++    if selected_sort == "low": result.sort(key=lambda p: p["price_cents"])
++    if selected_sort == "high": result.sort(key=lambda p: -p["price_cents"])
++    if selected_sort == "name": result.sort(key=lambda p: p["name"].lower())
++    return result
++
++
++def result_grid():
++    found = visible_products()
++    if not found: return '<div class="empty-state"><h3>No items found.</h3><p>Try another size, category or search.</p><button class="btn btn-outline" data-action="clear-filters">CLEAR FILTERS</button></div>'
++    return '<div class="product-grid">'+"".join(product_card(p) for p in found)+'</div>'
++
++
++def option_menu(values, current):
++    return "".join(f'<option value="{esc(v)}" {"selected" if v==current else ""}>{esc(v)}</option>' for v in values)
++
++
++def render_shop():
++    categories = ["All Products"] + sorted(set(p["category"] for p in products))
++    buttons = "".join(f'<button class="cat-btn {"active" if c==selected_category else ""}" data-action="category" data-category="{esc(c)}">{esc(c)}</button>' for c in categories)
++    page(hero("Explore Our Collection", "Find your next everyday essential.") + f'''<section class="section"><div class="container shop-layout"><aside class="filters" aria-label="Product filters"><div class="filter-block"><span class="filter-label">Category</span>{buttons}</div><div class="filter-block"><label for="shop-search" class="filter-label">Search products</label><input class="field" type="search" id="shop-search" placeholder="Find your fit..." value="{esc(search_text)}"></div><div class="filter-block"><label for="filter-size" class="filter-label">Size</label><select class="field" id="filter-size">{option_menu(['All Sizes','S','M','L','XL'],selected_size)}</select></div><div class="filter-block"><label for="filter-price" class="filter-label">Price range</label><select class="field" id="filter-price">{option_menu(['All Prices','Under ₱1,000','₱1,000 – ₱1,500','Over ₱1,500'],selected_price)}</select></div></aside><div><div class="shop-topline"><span id="results-count" class="small muted">{len(visible_products())} products</span><label class="small" for="shop-sort">Sort by <select class="mini-select" id="shop-sort">{option_menu(['featured','low','high','name'],selected_sort)}</select></label></div><div id="shop-results">{result_grid()}</div></div></div></section>''')
++
++
++def update_shop_results():
++    grid = document.getElementById("shop-results")
++    if grid:
++        grid.innerHTML = result_grid()
++        document.getElementById("results-count").textContent = f"{len(visible_products())} products"
++
++
++def render():
++    route = get_route()
++    if route == "/shop": render_shop()
++    else: render_home()
++
++
++def on_click(event):
++    global selected_category, selected_size, selected_price, search_text
++    el = event.target.closest("[data-action]")
++    if not el: return
++    action = el.getAttribute("data-action")
++    if action == "category":
++        selected_category = el.getAttribute("data-category")
++        render_shop()
++    elif action == "clear-filters":
++        selected_category, selected_size, selected_price, search_text = "All Products", "All Sizes", "All Prices", ""
++        render_shop()
++
++
++def on_input(event):
++    global search_text
++    if event.target.id == "shop-search":
++        search_text = str(event.target.value)
++        update_shop_results()
++
++
++def on_change(event):
++    global selected_size, selected_price, selected_sort
++    el = event.target
++    if el.id == "filter-size": selected_size = str(el.value); update_shop_results()
++    elif el.id == "filter-price": selected_price = str(el.value); update_shop_results()
++    elif el.id == "shop-sort": selected_sort = str(el.value); update_shop_results()
++
++
++async def init():
++    global products
++    try:
++        resp = await window.fetch("/api/products")
++        if not resp.ok: raise RuntimeError("Product service unavailable")
++        products = (await resp.json()).to_py()["products"]
++        render()
++    except Exception:
++        document.getElementById("page-content").innerHTML = '<div class="container empty-state"><h2>Our collection is temporarily unavailable.</h2><p>Please refresh the page or try again shortly.</p></div>'
++
+ 
+-render_home()
++# Keep strong references to proxies so Pyodide never garbage-collects live handlers.
++_handlers = [create_proxy(on_click), create_proxy(on_input), create_proxy(on_change), create_proxy(lambda event: render())]
++document.addEventListener("click", _handlers[0])
++document.addEventListener("input", _handlers[1])
++document.addEventListener("change", _handlers[2])
++window.addEventListener("hashchange", _handlers[3])
++asyncio.create_task(init())
+diff --git a/store.py b/store.py
+new file mode 100644
+index 0000000..b2fde24
+--- /dev/null
++++ b/store.py
+@@ -0,0 +1,81 @@
++"""SQLite persistence and the starter product catalog."""
++import json
++import sqlite3
++from flask import current_app, g
++
++PRODUCTS = [
++    ("Monclo Essential Tee", "T-Shirts", "A timeless everyday cotton essential.", 69900, ["S", "M", "L", "XL"], ["White", "Black", "Stone"], 22, "photo-1521572163474-6864f9cf17ab", 1),
++    ("Foundation Oversized Tee", "Oversized Shirts", "Easy proportions. Confident silhouette.", 84900, ["S", "M", "L", "XL"], ["Charcoal", "Silver", "Cream"], 17, "photo-1503342217505-b0a15ec3261c", 1),
++    ("Studio Heavyweight Tee", "T-Shirts", "A substantial feel, refined details.", 99900, ["S", "M", "L", "XL"], ["Black", "Ash"], 15, "photo-1503341504253-dff4815485f1", 1),
++    ("Everyday Knit Polo", "Polo Shirts", "A clean take on smart casual comfort.", 119900, ["S", "M", "L", "XL"], ["Navy", "Grey", "Cream"], 12, "photo-1625910513413-5fc45a947ec6", 0),
++    ("Monclo Club Hoodie", "Hoodies", "Soft layers for slower days.", 189900, ["S", "M", "L", "XL"], ["Slate", "Black"], 10, "photo-1556821840-3a63f95609a7", 1),
++    ("Relaxed Oxford Shirt", "Other Apparel", "Relaxed tailoring meets street-ready style.", 129900, ["S", "M", "L", "XL"], ["Sky", "White"], 11, "photo-1598032895397-b9472444bf93", 0),
++    ("Minimal Logo Tee", "T-Shirts", "Understated branding, everyday comfort.", 74900, ["S", "M", "L", "XL"], ["Grey", "White", "Black"], 24, "photo-1562157873-818bc0726f68", 1),
++    ("Weekend Zip Hoodie", "Hoodies", "Zip up and head out.", 209900, ["M", "L", "XL"], ["Silver", "Midnight"], 8, "photo-1578681994506-b8f463449011", 0),
++    ("Urban Utility Overshirt", "Other Apparel", "The perfect finishing layer.", 159900, ["S", "M", "L", "XL"], ["Slate", "Sand"], 7, "photo-1591047139829-d91aecb6caea", 0),
++]
++
++SCHEMA = """
++CREATE TABLE IF NOT EXISTS products (
++ id INTEGER PRIMARY KEY AUTOINCREMENT,
++ name TEXT NOT NULL, category TEXT NOT NULL, description TEXT NOT NULL,
++ price_cents INTEGER NOT NULL CHECK(price_cents>=0),
++ sizes TEXT NOT NULL, colors TEXT NOT NULL,
++ stock INTEGER NOT NULL CHECK(stock>=0), image_url TEXT NOT NULL,
++ featured INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1
++);
++CREATE TABLE IF NOT EXISTS orders (
++ id INTEGER PRIMARY KEY AUTOINCREMENT, reference TEXT UNIQUE NOT NULL,
++ idempotency_key TEXT UNIQUE NOT NULL, customer_name TEXT NOT NULL,
++ phone TEXT NOT NULL, address TEXT NOT NULL, city TEXT NOT NULL,
++ province TEXT NOT NULL, postal_code TEXT NOT NULL, instructions TEXT NOT NULL,
++ subtotal_cents INTEGER NOT NULL, delivery_cents INTEGER NOT NULL,
++ total_cents INTEGER NOT NULL, payment_method TEXT NOT NULL DEFAULT 'COD',
++ status TEXT NOT NULL DEFAULT 'Pending', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++);
++CREATE TABLE IF NOT EXISTS order_items (
++ id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL REFERENCES orders(id),
++ product_id INTEGER, name TEXT NOT NULL, size TEXT NOT NULL, color TEXT NOT NULL,
++ quantity INTEGER NOT NULL, unit_cents INTEGER NOT NULL
++);
++CREATE TABLE IF NOT EXISTS feedback (
++ id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
++ email TEXT NOT NULL, category TEXT NOT NULL, message TEXT NOT NULL,
++ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++);
++"""
++
++
++def get_db():
++    if "db" not in g:
++        db = sqlite3.connect(current_app.config["DATABASE"], timeout=10)
++        db.row_factory = sqlite3.Row
++        db.execute("PRAGMA foreign_keys=ON")
++        db.execute("PRAGMA busy_timeout=10000")
++        g.db = db
++    return g.db
++
++
++def close_db(error=None):
++    db = g.pop("db", None)
++    if db is not None:
++        db.close()
++
++
++def init_db():
++    db = get_db()
++    db.executescript(SCHEMA)
++    if db.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
++        for name, category, description, cents, sizes, colors, stock, photo, featured in PRODUCTS:
++            image = f"https://images.unsplash.com/{photo}?w=840&h=1000&fit=crop&auto=format&q=80"
++            db.execute("INSERT INTO products (name, category, description, price_cents, sizes, colors, stock, image_url, featured) VALUES (?,?,?,?,?,?,?,?,?)", (name, category, description, cents, json.dumps(sizes), json.dumps(colors), stock, image, featured))
++    db.commit()
++
++
++def serialize_product(row):
++    result = dict(row)
++    result["sizes"] = json.loads(result["sizes"])
++    result["colors"] = json.loads(result["colors"])
++    result["featured"] = bool(result["featured"])
++    result["active"] = bool(result["active"])
++    return result
+-- 
+2.47.3
+
