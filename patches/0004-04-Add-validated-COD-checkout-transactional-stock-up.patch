@@ -1,0 +1,303 @@
+From 83ce17c07fe8d3c8c22c63ed0a94f566cab0b9d0 Mon Sep 17 00:00:00 2001
+From: Monclo Development <dev@monclo.local>
+Date: Thu, 22 Oct 2026 02:11:16 +0000
+Subject: [PATCH 4/6] 04: Add validated COD checkout, transactional stock
+ updates and saved confirmations
+
+---
+ checkout.py      |  98 ++++++++++++++++++++++++++++++++++++++++++++++
+ server.py        |   3 ++
+ static/py/app.py | 100 ++++++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 199 insertions(+), 2 deletions(-)
+ create mode 100644 checkout.py
+
+diff --git a/checkout.py b/checkout.py
+new file mode 100644
+index 0000000..36974b4
+--- /dev/null
++++ b/checkout.py
+@@ -0,0 +1,98 @@
++"""Cash on Delivery ordering with server-side validation, inventory locks and idempotency."""
++import json
++import re
++import secrets
++import sqlite3
++from flask import request, jsonify
++from store import get_db
++
++DELIVERY_CENTS = 12000
++PHONE = re.compile(r"^(?:\+63|0)9\d{9}$")
++POSTAL = re.compile(r"^\d{4}$")
++
++
++def error(message, status=400):
++    return jsonify(error=message), status
++
++
++def clean_field(data, key, maximum, minimum=1):
++    v = data.get(key, "")
++    if not isinstance(v, str): raise ValueError(f"Invalid {key.replace('_', ' ')}.")
++    v = " ".join(v.split())
++    if not minimum <= len(v) <= maximum:
++        raise ValueError(f"{key.replace('_', ' ').capitalize()} must contain {minimum}–{maximum} characters.")
++    return v
++
++
++def get_order(db, key):
++    order = db.execute("SELECT * FROM orders WHERE idempotency_key=?", (key,)).fetchone()
++    if not order: return None
++    lines = db.execute("SELECT name, size, color, quantity, unit_cents FROM order_items WHERE order_id=? ORDER BY id", (order["id"],)).fetchall()
++    return {"reference": order["reference"], "customer_name": order["customer_name"], "phone": order["phone"], "address": order["address"], "city": order["city"], "province": order["province"], "postal_code": order["postal_code"], "instructions": order["instructions"], "subtotal_cents": order["subtotal_cents"], "delivery_cents": order["delivery_cents"], "total_cents": order["total_cents"], "payment_method": "COD", "status": order["status"], "items": [dict(x) for x in lines]}
++
++
++def register_order_routes(app):
++    @app.post("/api/orders")
++    def create_order():
++        data = request.get_json(silent=True)
++        if not isinstance(data, dict): return error("Send a JSON order.")
++        key = data.get("idempotency_key")
++        if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f\-]{32,50}", key):
++            return error("Missing or invalid order request ID.")
++        if data.get("payment_method") != "COD":
++            return error("Cash on Delivery is the only supported payment method.")
++        db = get_db()
++        try:
++            # Acquire a write lock before the stock check so simultaneous orders cannot oversell.
++            db.execute("BEGIN IMMEDIATE")
++            already_saved = get_order(db, key)
++            if already_saved:
++                db.commit()
++                return jsonify(already_saved)
++            info = {k: clean_field(data, k, maxlen, minlen) for k, maxlen, minlen in [
++                ("customer_name", 90, 2), ("phone", 22, 10), ("address", 240, 8),
++                ("city", 90, 2), ("province", 90, 2), ("postal_code", 4, 0),
++                ("instructions", 500, 0),
++            ]}
++            phone = re.sub(r"[\s-]", "", info["phone"])
++            if not PHONE.fullmatch(phone): raise ValueError("Enter a valid Philippine mobile number (09xxxxxxxxx or +639xxxxxxxxx).")
++            info["phone"] = phone
++            if info["postal_code"] and not POSTAL.fullmatch(info["postal_code"]):
++                raise ValueError("Postal code must be exactly four digits.")
++            items = data.get("items")
++            if not isinstance(items, list) or not 1 <= len(items) <= 30:
++                raise ValueError("Your order must include 1 to 30 selected items.")
++            prepared, totals_by_product = [], {}
++            subtotal = 0
++            for item in items:
++                if not isinstance(item, dict): raise ValueError("Invalid cart item.")
++                pid, size, color, qty = (item.get(x) for x in ("product_id", "size", "color", "quantity"))
++                if type(pid) is not int or type(qty) is not int or qty < 1 or qty > 50:
++                    raise ValueError("Invalid product ID or quantity.")
++                product = db.execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
++                if not product: raise ValueError("A product in your cart is no longer available.")
++                if size not in json.loads(product["sizes"]) or color not in json.loads(product["colors"]):
++                    raise ValueError(f"Choose a valid size and color for {product['name']}.")
++                totals_by_product[pid] = totals_by_product.get(pid, 0) + qty
++                if totals_by_product[pid] > product["stock"]:
++                    raise ValueError(f"Not enough stock available for {product['name']}.")
++                subtotal += product["price_cents"] * qty
++                prepared.append((pid, product["name"], size, color, qty, product["price_cents"]))
++            for pid, qty in totals_by_product.items():
++                db.execute("UPDATE products SET stock=stock-? WHERE id=? AND stock>=?", (qty, pid, qty))
++                if db.execute("SELECT changes()").fetchone()[0] != 1:
++                    raise ValueError("Stock changed while ordering. Refresh the collection and try again.")
++            reference = "MNC-" + secrets.token_hex(5).upper()
++            db.execute("INSERT INTO orders (reference,idempotency_key,customer_name,phone,address,city,province,postal_code,instructions,subtotal_cents,delivery_cents,total_cents,payment_method) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (reference,key,info["customer_name"],info["phone"],info["address"],info["city"],info["province"],info["postal_code"],info["instructions"],subtotal,DELIVERY_CENTS,subtotal+DELIVERY_CENTS,"COD"))
++            order_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
++            for item in prepared:
++                db.execute("INSERT INTO order_items (order_id,product_id,name,size,color,quantity,unit_cents) VALUES (?,?,?,?,?,?,?)", (order_id,*item))
++            db.commit()
++            return jsonify(get_order(db, key)), 201
++        except ValueError as exc:
++            db.rollback()
++            return error(str(exc))
++        except sqlite3.DatabaseError:
++            db.rollback()
++            app.logger.exception("Failed to save COD order")
++            return error("Could not save your order. Please try again.", 500)
+diff --git a/server.py b/server.py
+index e0afd99..04e36e0 100644
+--- a/server.py
++++ b/server.py
+@@ -2,6 +2,7 @@
+ import os
+ from flask import Flask, render_template
+ from store import get_db, close_db, init_db, serialize_product
++from checkout import register_order_routes
+ 
+ 
+ def create_app(test_config=None):
+@@ -28,6 +29,8 @@ def create_app(test_config=None):
+         rows = db.execute("SELECT * FROM products WHERE active=1 ORDER BY featured DESC, id ASC").fetchall()
+         return {"products": [serialize_product(row) for row in rows]}
+ 
++    register_order_routes(app)
++
+     @app.get("/")
+     def index():
+         return render_template("index.html")
+diff --git a/static/py/app.py b/static/py/app.py
+index e497c1a..1464b06 100644
+--- a/static/py/app.py
++++ b/static/py/app.py
+@@ -2,6 +2,7 @@
+ import asyncio
+ import html
+ import json
++import uuid
+ from pyscript import document, window
+ from pyodide.ffi import create_proxy
+ 
+@@ -13,6 +14,9 @@ selected_sort = "featured"
+ search_text = ""
+ CART_KEY = "monclo_cart_v1"
+ BUY_KEY = "monclo_buy_now_v1"
++CONFIRM_KEY = "monclo_confirm_v1"
++ORDER_KEY = "monclo_pending_order_key"
++placing_order = False
+ 
+ 
+ def esc(value):
+@@ -156,6 +160,7 @@ def add_product(pid, buy=False):
+     if size not in p["sizes"] or color not in p["colors"]:
+         toast("Please choose a valid size and color."); return
+     item = {"product_id":pid,"size":size,"color":color,"quantity":qty}
++    window.sessionStorage.removeItem(ORDER_KEY)
+     if buy:
+         window.sessionStorage.setItem(BUY_KEY, json.dumps([item]))
+         window.location.hash = "/checkout"
+@@ -214,15 +219,99 @@ def modify_cart(action, index):
+         if p and all_qty >= p["stock"]:
+             toast("You have reached available stock."); return
+         item["quantity"] += 1
++    window.sessionStorage.removeItem(ORDER_KEY)
+     save_cart(items)
+     render_cart()
+ 
+ 
++def form_field(label, name, required=True, kind="text", wide=False, placeholder="", attrs=""):
++    req = "required" if required else ""
++    return f'<label class="form-field {"wide" if wide else ""}">{esc(label)}<input class="field" type="{kind}" name="{esc(name)}" placeholder="{esc(placeholder)}" {req} {attrs}></label>'
++
++
++def render_checkout():
++    items = checkout_items()
++    if not items:
++        page(hero("Checkout", "Finish your order with Cash on Delivery.")+'<section class="section"><div class="container empty-state"><h3>Your checkout is empty.</h3><p>Please select an item before checking out.</p><a class="btn" href="#/shop">SHOP NOW ↗</a></div></section>')
++        return
++    fields = (form_field("Full name *", "customer_name", attrs='minlength="2" maxlength="90"') +
++              form_field("Mobile number *", "phone", kind="tel", placeholder="09xxxxxxxxx", attrs='pattern="(09[0-9]{9}|[+]639[0-9]{9})"') +
++              form_field("Complete delivery address *", "address", wide=True, attrs='minlength="8" maxlength="240"') +
++              form_field("City / Municipality *", "city", attrs='minlength="2" maxlength="90"') +
++              form_field("Province *", "province", attrs='minlength="2" maxlength="90"') +
++              form_field("Postal code (optional)", "postal_code", attrs='pattern="[0-9]{4}" maxlength="4"') +
++              '<div></div><label class="form-field wide">Delivery instructions (optional)<textarea class="field" name="instructions" maxlength="500" placeholder="Landmark, building, or preferred delivery notes..."></textarea></label>')
++    form = f'''<form id="order-form"><div class="form-section"><span class="eyebrow">STEP 01 / DELIVERY</span><h3>Where should we send your order?</h3><div class="form-grid">{fields}</div></div><div class="form-section"><span class="eyebrow">STEP 02 / PAYMENT</span><h3>Payment method</h3><div class="cod-card"><strong>◉ &nbsp;Cash on Delivery (COD)</strong><p>Pay for your order in cash when it arrives at your delivery address.</p></div></div><div class="form-section"><p class="notice">Please check your items and delivery information carefully before confirming your order.</p><p id="order-error" class="form-error" role="alert"></p><button type="submit" class="btn btn-block" id="place-order">PLACE ORDER · CASH ON DELIVERY ↗</button></div></form>'''
++    page(hero("Secure Checkout", "One last step to your next favorite fit.")+f'<section class="section"><div class="container checkout-layout"><div>{form}</div>{summary(items, True)}</div></section>')
++
++
++async def api_request(path, data=None, method="GET", csrf=None):
++    options = {"method": method, "headers": {"Content-Type": "application/json"}}
++    if csrf: options["headers"]["X-CSRF-Token"] = csrf
++    if data is not None: options["body"] = json.dumps(data)
++    response = await window.fetch(path, window.JSON.parse(json.dumps(options)))
++    payload = (await response.json()).to_py()
++    if not response.ok: raise ValueError(payload.get("error", "The request failed."))
++    return payload
++
++
++async def place_order():
++    global placing_order, products
++    if placing_order: return
++    items = checkout_items()
++    if not items: toast("Your checkout is empty."); return
++    form = document.getElementById("order-form")
++    if not form or not form.checkValidity():
++        if form: form.reportValidity()
++        return
++    values = {field: str(form.elements.namedItem(field).value).strip() for field in ("customer_name", "phone", "address", "city", "province", "postal_code", "instructions")}
++    key = str(window.sessionStorage.getItem(ORDER_KEY) or uuid.uuid4())
++    window.sessionStorage.setItem(ORDER_KEY, key)
++    btn = document.getElementById("place-order")
++    placing_order = True
++    btn.disabled = True
++    btn.textContent = "SAVING YOUR ORDER..."
++    try:
++        data = await api_request("/api/orders", {**values, "payment_method":"COD", "items":items, "idempotency_key":key}, "POST")
++        window.sessionStorage.setItem(CONFIRM_KEY, json.dumps(data))
++        if not window.sessionStorage.getItem(BUY_KEY):
++            save_cart([])
++        window.sessionStorage.removeItem(BUY_KEY)
++        window.sessionStorage.removeItem(ORDER_KEY)
++        try:
++            result = await window.fetch("/api/products")
++            if result.ok: products = (await result.json()).to_py()["products"]
++        except Exception: pass
++        window.location.hash = "/confirmation"
++        render_confirmation()
++    except Exception as exc:
++        error = document.getElementById("order-error")
++        if error: error.textContent = str(exc)
++        btn.disabled = False
++        btn.textContent = "RETRY PLACE ORDER ↗"
++    finally:
++        placing_order = False
++
++
++def render_confirmation():
++    try:
++        order = json.loads(str(window.sessionStorage.getItem(CONFIRM_KEY) or "null"))
++    except Exception:
++        order = None
++    if not isinstance(order, dict) or "reference" not in order:
++        page(hero("Order confirmation", "Cash on Delivery checkout.")+'<section class="section"><div class="container empty-state"><p>No confirmed order is available in this browser tab.</p><a class="btn" href="#/shop">RETURN TO SHOP</a></div></section>')
++        return
++    details = "".join(f'<div class="total-row"><span>{esc(i["name"])} · {esc(i["size"])} / {esc(i["color"])} × {i["quantity"]}</span><strong>{peso(i["unit_cents"]*i["quantity"])}</strong></div>' for i in order["items"])
++    address = ", ".join(esc(order[k]) for k in ("address", "city", "province", "postal_code") if order.get(k))
++    page(f'''<section class="section"><div class="container"><div class="success-panel"><div class="success-mark">✓</div><span class="eyebrow">ORDER SAVED SUCCESSFULLY</span><h2>Thank you for your order!</h2><p>Your order has been placed with Cash on Delivery.<br>Save your reference number for any order inquiries.</p><h3 style="font-size:25px;margin:22px 0">{esc(order["reference"])}</h3><div class="order-details">{details}<div class="total-row"><span>Subtotal</span><strong>{peso(order["subtotal_cents"])}</strong></div><div class="total-row"><span>Delivery fee</span><strong>{peso(order["delivery_cents"])}</strong></div><div class="total-row major"><span>Total to pay on delivery</span><strong>{peso(order["total_cents"])}</strong></div><p class="small"><strong>Payment:</strong> Cash on Delivery (COD)<br><strong>Recipient:</strong> {esc(order["customer_name"])}<br><strong>Mobile:</strong> {esc(order["phone"])}<br><strong>Delivery address:</strong> {address}</p></div><a class="btn" href="#/shop">BACK TO SHOP ↗</a></div></div></section>''')
++
++
+ def render():
+     route = get_route()
+     if route == "/shop": render_shop()
+     elif route == "/cart": render_cart()
+-    elif route == "/checkout": render_cart()
++    elif route == "/checkout": render_checkout()
++    elif route == "/confirmation": render_confirmation()
+     else: render_home()
+ 
+ 
+@@ -240,12 +329,18 @@ def on_click(event):
+         modify_cart(action, int(el.getAttribute("data-index")))
+     elif action == "checkout":
+         window.sessionStorage.removeItem(BUY_KEY)
++        window.sessionStorage.removeItem(ORDER_KEY)
+         window.location.hash = "/checkout"
+     elif action == "clear-filters":
+         selected_category, selected_size, selected_price, search_text = "All Products", "All Sizes", "All Prices", ""
+         render_shop()
+ 
+ 
++def on_submit(event):
++    if event.target.id == "order-form":
++        event.preventDefault()
++        asyncio.create_task(place_order())
++
+ def on_input(event):
+     global search_text
+     if event.target.id == "shop-search":
+@@ -274,9 +369,10 @@ async def init():
+ 
+ 
+ # Keep strong references to proxies so Pyodide never garbage-collects live handlers.
+-_handlers = [create_proxy(on_click), create_proxy(on_input), create_proxy(on_change), create_proxy(lambda event: render())]
++_handlers = [create_proxy(on_click), create_proxy(on_input), create_proxy(on_change), create_proxy(lambda event: render()), create_proxy(on_submit)]
+ document.addEventListener("click", _handlers[0])
+ document.addEventListener("input", _handlers[1])
+ document.addEventListener("change", _handlers[2])
++document.addEventListener("submit", _handlers[4])
+ window.addEventListener("hashchange", _handlers[3])
+ asyncio.create_task(init())
+-- 
+2.47.3
+
