@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#292d32">
+  <meta name="description" content="Monclo Apparel — elevated everyday streetwear essentials. Shop tees, polos, hoodies and more in the Philippines.">
+  <title>Monclo Apparel — Wear Your Style</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="stylesheet" href="https://pyscript.net/releases/2026.7.3/core.css">
+  <script type="module" src="https://pyscript.net/releases/2026.7.3/core.js"></script>
+</head>
+<body>
+  <div class="announcement">NEW SEASON, NEW ESSENTIALS <span>✦</span> CASH ON DELIVERY NATIONWIDE</div>
+  <header class="site-header">
+    <div class="container nav-wrap">
+      <a href="#/" class="wordmark" aria-label="Monclo Apparel home"><span class="logo-mark">M<span>✦</span></span><span>MONCLO<small>APPAREL</small></span></a>
+      <nav class="main-nav" aria-label="Main navigation"><a href="#/" data-nav="home">Home</a><a href="#/shop" data-nav="shop">Shop</a><a href="#/support" data-nav="support">Support</a></nav>
+      <a class="cart-link" href="#/cart" aria-label="Shopping cart"><svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M7 7V6a5 5 0 0 1 10 0v1M4.8 7h14.4l1 13H3.8z"/></svg><span>Bag</span><span class="cart-count" id="cart-count">0</span></a>
+    </div>
+  </header>
+  <div id="app-status" class="sr-only" role="status" aria-live="polite"></div>
+  <main id="page-content"><div class="container loading-screen"><div class="spinner"></div><p>Preparing your collection…</p></div></main>
+  <footer class="footer"><div class="container footer-grid"><div><a href="#/" class="footer-logo">MONCLO <span>APPAREL.</span></a><p>Modern essentials, made for your every day. Your style. Your story.</p></div><div><strong>Explore</strong><a href="#/">Home</a><a href="#/shop">Shop all</a><a href="#/cart">Your bag</a></div><div><strong>Customer care</strong><a href="#/support">Contact &amp; feedback</a><a href="#/support">FAQ</a><span>Cash on Delivery</span></div><div><strong>Connect</strong><span>Philippines</span><a id="social-link" href="#/support">Instagram (configure link)</a><a id="email-link" href="#/support">Use our support form ↗</a></div></div><div class="container footer-bottom"><span>© 2026 Monclo Apparel. All rights reserved.</span><span>DESIGNED TO BE DIFFERENT ✦</span></div></footer>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script type="py" src="/static/py/app.py"></script>
+</body>
+</html>
